@@ -378,12 +378,15 @@ class TboDPAttentionPreparer:
                 num_tokens = local_batch.batch_size() * token_num_per_seq
             else:
                 num_tokens = local_batch.extend_num_tokens
-            self.local_tbo_split_seq_index = compute_split_seq_index(
-                forward_mode=local_batch.forward_mode,
-                num_tokens=num_tokens,
-                extend_lens=local_batch.extend_lens,
-                token_num_per_seq=token_num_per_seq,
-            )
+            if self.enable_two_batch_overlap:
+                self.local_tbo_split_seq_index = compute_split_seq_index(
+                    forward_mode=local_batch.forward_mode,
+                    num_tokens=num_tokens,
+                    extend_lens=local_batch.extend_lens,
+                    token_num_per_seq=token_num_per_seq,
+                )
+            else:
+                self.local_tbo_split_seq_index = None
             resolved_deepep_mode = deepep_mode.resolve(local_batch.is_extend_in_batch)
             local_can_run_tbo = (self.local_tbo_split_seq_index is not None) and not (
                 (
