@@ -295,6 +295,7 @@ def build_kv_cache(
             hidden_dims=hidden_dims,
             tp_group=tp_cpu_group,
             all_rank_get=False,
+            enable_sharded_load=True,
         )
         init_mm_global_cache(global_cache)
         logger.info(

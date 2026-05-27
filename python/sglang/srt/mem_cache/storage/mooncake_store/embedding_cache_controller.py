@@ -98,12 +98,14 @@ class EmbeddingCacheController:
         hidden_dims: dict = None,
         tp_group=None,
         all_rank_get=False,
+        enable_sharded_load: bool = False,
     ):
         self.tp_rank = tp_rank
         self.tp_world_size = tp_size
         self.tp_group = tp_group
         self.all_rank_get = all_rank_get
         self.hidden_dims = hidden_dims or {}
+        self.enable_sharded_load = enable_sharded_load
         self.element_size = torch.float32.itemsize
 
         # 1. Mooncake Backend & Pinned Buffer
@@ -137,8 +139,9 @@ class EmbeddingCacheController:
             )
 
             group_ranks = torch.distributed.get_process_group_ranks(self.tp_group)
+            backend = "nccl" if self.enable_sharded_load else "gloo"
             self.prefetch_tp_group = create_custom_parallel_group(
-                group_ranks=group_ranks, backend="gloo"
+                group_ranks=group_ranks, backend=backend
             )
         else:
             self.prefetch_tp_group = None
@@ -325,3 +328,114 @@ class EmbeddingCacheController:
             f"Misses (GPU Work): {miss_count}"
         )
         return local_results
+
+    def _get_embedding_from_local(self, image_hash: str) -> Optional[torch.Tensor]:
+        """Get embedding from local cpu_pool (internal use)."""
+        with self.lock:
+            if image_hash not in self.hash_to_metadata:
+                return None
+            offset, num_tokens, dim, size_bytes = self.hash_to_metadata[image_hash][:4]
+            return (
+                self.cpu_pool[offset : offset + size_bytes]
+                .view(torch.float32)
+                .view(num_tokens, dim)
+            )
+
+    def _has_hash(self, image_hash: str) -> bool:
+        """Check if hash exists in local cache."""
+        with self.lock:
+            return image_hash in self.hash_to_metadata
+
+    def _insert_embedding(self, image_hash: str, embedding: torch.Tensor) -> bool:
+        """Insert embedding into local cache (internal use).
+
+        Returns True if successful, False otherwise.
+        """
+        num_tokens, dim = embedding.shape
+        size_bytes = num_tokens * dim * self.element_size
+
+        with self.lock:
+            if image_hash in self.hash_to_metadata:
+                return True
+
+            offset = self.allocator.allocate(size_bytes)
+            if offset is None:
+                logger.warning(f"Failed to allocate memory for {image_hash}")
+                return False
+
+            target_view = (
+                self.cpu_pool[offset : offset + size_bytes]
+                .view(torch.float32)
+                .view(num_tokens, dim)
+            )
+            target_view.copy_(embedding.cpu())
+            self.hash_to_metadata[image_hash] = (offset, num_tokens, dim, size_bytes)
+
+        return True
+
+    def get_embeddings_distributed(
+        self,
+        image_hashes: List[str],
+        expected_tokens: List[int],
+        modality: Optional[str] = None,
+    ) -> List[Optional[torch.Tensor]]:
+        """Distributed loading with optional sharding optimization.
+
+        If enable_sharded_load=True, each TP rank loads only 1/TP_SIZE of the
+        data from Mooncake, then exchanges via all_gather. This reduces
+        Mooncake network traffic by TP_SIZE times.
+
+        If enable_sharded_load=False (default), falls back to full loading
+        where each rank loads all data independently.
+
+        Args:
+            image_hashes: List of image hashes to load
+            expected_tokens: Expected token count for each image
+            modality: Modality type for dimension lookup
+
+        Returns:
+            List of embeddings (same order as image_hashes), None for failed loads
+        """
+        if not self.enable_sharded_load or self.tp_world_size <= 1:
+            return self._get_embeddings_full_load(
+                image_hashes, expected_tokens, modality
+            )
+
+        try:
+            from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller_sharded import (
+                get_embeddings_distributed_sharded,
+            )
+
+            return get_embeddings_distributed_sharded(
+                self, image_hashes, expected_tokens, modality
+            )
+        except Exception as e:
+            logger.warning(f"Sharded load failed: {e}, falling back to full load")
+            return self._get_embeddings_full_load(
+                image_hashes, expected_tokens, modality
+            )
+
+    def _get_embeddings_full_load(
+        self,
+        image_hashes: List[str],
+        expected_tokens: List[int],
+        modality: Optional[str] = None,
+    ) -> List[Optional[torch.Tensor]]:
+        """Original full-load behavior: each rank loads all data."""
+        if not image_hashes:
+            return []
+
+        req_id = f"full_{self.tp_rank}_{image_hashes[0][:16]}"
+        self.prefetch(req_id, image_hashes, expected_tokens, modality)
+
+        import time
+
+        max_wait = 30.0
+        start_time = time.time()
+        while not self.check_prefetch_progress(req_id):
+            if time.time() - start_time > max_wait:
+                logger.warning(f"Timeout waiting for prefetch {req_id}")
+                break
+            time.sleep(0.002)
+
+        return self.get_embeddings(image_hashes)
