@@ -413,10 +413,12 @@ class EmbeddingCacheController:
 
                     # Still push to Mooncake for multi-node sharing
                     # (Mooncake batch_put will deduplicate if already exists)
-                    keys.append(h)
-                    ptrs.append(self.cpu_pool.data_ptr() + offset)
-                    sizes.append(size_bytes)
-                    local_hit_count += 1
+                    if self.tp_rank == 0:
+                        self._protect_hash(h)
+                        keys.append(h)
+                        ptrs.append(self.cpu_pool.data_ptr() + offset)
+                        sizes.append(size_bytes)
+                        local_hit_count += 1
                     continue
 
                 # Local cache miss: allocate and copy
@@ -440,12 +442,13 @@ class EmbeddingCacheController:
                 target_view.copy_(tensor.cpu())
                 self.hash_to_metadata[h] = (offset, num_tokens, dim, size_bytes)
                 self._update_access_time(h)
-                self._protect_hash(h)
+                if self.tp_rank == 0:
+                    self._protect_hash(h)
 
-                keys.append(h)
-                ptrs.append(self.cpu_pool.data_ptr() + offset)
-                sizes.append(size_bytes)
-                new_count += 1
+                    keys.append(h)
+                    ptrs.append(self.cpu_pool.data_ptr() + offset)
+                    sizes.append(size_bytes)
+                    new_count += 1
 
             if self.tp_rank == 0 and keys:
                 logger.info(
