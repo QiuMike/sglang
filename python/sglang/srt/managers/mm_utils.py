@@ -645,14 +645,16 @@ def _check_l2_global_cache(
     all_l1_miss_items: List[MultimodalDataItem],
     all_l1_miss_token_counts: List[int],
     data_embedding_func: DataEmbeddingFunc,
-) -> Tuple[Dict[int, torch.Tensor], List[MultimodalDataItem], List[int]]:
+    device: torch.device,
+) -> Tuple[Dict[int, torch.Tensor], List[MultimodalDataItem], List[int], List[str]]:
     """Check L2 (Global Cache) for L1 misses.
 
     Returns:
-        (hash_to_l2_emb, l2_miss_items, l2_miss_token_counts)
+        (hash_to_l2_emb, l2_miss_items, l2_miss_token_counts, global_hit_hashes)
         - hash_to_l2_emb: mapping from item hash to L2-cached embedding
         - l2_miss_items: items that miss both L1 and L2
         - l2_miss_token_counts: corresponding token counts for L2 misses
+        - global_hit_hashes: hashes fetched from global cache (need release_embeddings)
     """
     hash_to_l2_emb = {}
     l2_miss_items = []
@@ -660,7 +662,7 @@ def _check_l2_global_cache(
     global_hit_hashes = []
 
     if mm_global_cache_controller is None or not all_l1_miss_items:
-        return hash_to_l2_emb, list(all_l1_miss_items), list(all_l1_miss_token_counts)
+        return hash_to_l2_emb, list(all_l1_miss_items), list(all_l1_miss_token_counts), global_hit_hashes
 
     max_batch = envs.SGLANG_MM_GLOBAL_CACHE_MAX_BATCH.get()
     exist_timeout = envs.SGLANG_MM_GLOBAL_CACHE_EXIST_TIMEOUT.get()
@@ -739,6 +741,10 @@ def _check_l2_global_cache(
                         f"Global cache prefetch timeout ({prefetch_timeout:.2f}s), "
                         f"falling back {len(global_hit_hashes)} items to ViT"
                     )
+                    # Clean up the ongoing prefetch entry to avoid leaking
+                    # the EmbeddingPrefetchOperation object.
+                    with mm_global_cache_controller.lock:
+                        mm_global_cache_controller.ongoing_prefetch.pop(req_id, None)
                     # Move all global hits back to L2 misses
                     for item, tc in global_hit_items:
                         l2_check_miss.append((item, tc))
@@ -764,8 +770,11 @@ def _check_l2_global_cache(
                         l2_check_miss.append((item, token_count))
                         continue
                     hash_to_l2_emb[item.hash] = emb
-                    # Also write to L1 cache for future local hits
-                    emb_result = EmbeddingResult(embedding=emb)
+                    # Also write to L1 cache for future local hits.
+                    # Move to device so L1 stores GPU tensors and avoids
+                    # device-mismatch errors in subsequent forward passes.
+                    emb_on_device = emb.to(device) if emb.device != device else emb
+                    emb_result = EmbeddingResult(embedding=emb_on_device)
                     embedding_cache.set(item.hash, emb_result)
                     successful_items.append((item, token_count))
 
@@ -985,7 +994,7 @@ def _get_chunked_prefill_embedding(
 
     # 2. Check L2 (Global Cache) for L1 misses
     hash_to_l2_emb, l2_miss_items, l2_miss_token_counts, global_hit_hashes = _check_l2_global_cache(
-        all_l1_miss_items, all_l1_miss_token_counts, data_embedding_func
+        all_l1_miss_items, all_l1_miss_token_counts, data_embedding_func, device
     )
 
     # 3. TP-Group synchronization
@@ -994,59 +1003,71 @@ def _get_chunked_prefill_embedding(
     )
 
     # 4. Batch encode all L2 cache-miss items in one ViT call
-    locally_encoded = []
-    if l2_miss_items:
-        if not _can_skip_pre_embed_feature_move(data_embedding_func):
-            _move_items_to_device(l2_miss_items, device)
-        all_miss_embedding = data_embedding_func(l2_miss_items)
-        all_miss_embedding = all_miss_embedding.reshape(
-            -1, all_miss_embedding.shape[-1]
-        )
-        miss_embeddings = list(
-            torch.split(all_miss_embedding, l2_miss_token_counts, dim=0)
-        )
-        for item, emb in zip(l2_miss_items, miss_embeddings):
-            embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
-            locally_encoded.append((item, emb))
-
     # 5. Write locally encoded embeddings back to L2 (Global Cache)
-    _write_back_l2_cache(locally_encoded)
-
     # 6. Fill in resolved embeddings and assemble per-request chunks
-    embedding_list = []
-    hash_to_resolved_emb = {}
-    hash_to_resolved_emb.update(hash_to_l2_emb)
-    for item, emb in locally_encoded:
-        hash_to_resolved_emb[item.hash] = emb
+    # All steps after _check_l2_global_cache must release ref counts on
+    # global_hit_hashes even if an exception occurs, otherwise cache
+    # entries are pinned forever.
+    try:
+        locally_encoded = []
+        if l2_miss_items:
+            if not _can_skip_pre_embed_feature_move(data_embedding_func):
+                _move_items_to_device(l2_miss_items, device)
+            all_miss_embedding = data_embedding_func(l2_miss_items)
+            all_miss_embedding = all_miss_embedding.reshape(
+                -1, all_miss_embedding.shape[-1]
+            )
+            miss_embeddings = list(
+                torch.split(all_miss_embedding, l2_miss_token_counts, dim=0)
+            )
+            for item, emb in zip(l2_miss_items, miss_embeddings):
+                embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
+                locally_encoded.append((item, emb))
 
-    for chunk_entries, chunk_start, chunk_end in pending_requests:
-        updated_entries = []
-        for item, emb, start, end in chunk_entries:
-            if emb is not None:
-                updated_entries.append((item, emb, start, end))
-            elif item.hash in hash_to_resolved_emb:
-                updated_entries.append(
-                    (item, hash_to_resolved_emb[item.hash], start, end)
-                )
-            else:
-                logger.warning(
-                    f"Item {item.hash} has no embedding after all cache tiers"
-                )
+        _write_back_l2_cache(locally_encoded)
 
-        chunk_embedding = assemble_chunk_embedding(
-            updated_entries, chunk_start, chunk_end
-        )
-        if chunk_embedding is not None:
-            embedding_list.append(chunk_embedding)
+        embedding_list = []
+        hash_to_resolved_emb = {}
+        hash_to_resolved_emb.update(hash_to_l2_emb)
+        for item, emb in locally_encoded:
+            hash_to_resolved_emb[item.hash] = emb
 
-    if len(embedding_list) == 0:
-        mm_global_cache_controller.release_embeddings(global_hit_hashes)
-        return None, input_ids
+        for chunk_entries, chunk_start, chunk_end in pending_requests:
+            updated_entries = []
+            for item, emb, start, end in chunk_entries:
+                if emb is not None:
+                    if emb.device != device:
+                        emb = emb.to(device)
+                        # Fix L1 cache entry so future hits are already on device
+                        embedding_cache.set(item.hash, EmbeddingResult(embedding=emb))
+                    updated_entries.append((item, emb, start, end))
+                elif item.hash in hash_to_resolved_emb:
+                    resolved_emb = hash_to_resolved_emb[item.hash]
+                    if resolved_emb.device != device:
+                        resolved_emb = resolved_emb.to(device)
+                        hash_to_resolved_emb[item.hash] = resolved_emb
+                    updated_entries.append(
+                        (item, resolved_emb, start, end)
+                    )
+                else:
+                    logger.warning(
+                        f"Item {item.hash} has no embedding after all cache tiers"
+                    )
 
-    embedding = torch.concat(embedding_list, dim=0)
-    mm_global_cache_controller.release_embeddings(global_hit_hashes)
+            chunk_embedding = assemble_chunk_embedding(
+                updated_entries, chunk_start, chunk_end
+            )
+            if chunk_embedding is not None:
+                embedding_list.append(chunk_embedding)
 
-    return embedding, input_ids
+        if len(embedding_list) == 0:
+            return None, input_ids
+
+        embedding = torch.concat(embedding_list, dim=0)
+        return embedding, input_ids
+    finally:
+        if mm_global_cache_controller is not None:
+            mm_global_cache_controller.release_embeddings(global_hit_hashes)
 
 
 def _get_multimodal_mask(
