@@ -657,6 +657,7 @@ def _check_l2_global_cache(
     hash_to_l2_emb = {}
     l2_miss_items = []
     l2_miss_token_counts = []
+    global_hit_hashes = []
 
     if mm_global_cache_controller is None or not all_l1_miss_items:
         return hash_to_l2_emb, list(all_l1_miss_items), list(all_l1_miss_token_counts)
@@ -698,7 +699,6 @@ def _check_l2_global_cache(
 
         # Categorize items by L2 existence
         global_hit_items = []  # (item, token_count) for L2 hits
-        global_hit_hashes = []
         l2_check_miss = []  # (item, token_count) for L2 misses
 
         for i, item in enumerate(items_to_check):
@@ -784,8 +784,11 @@ def _check_l2_global_cache(
         logger.warning(f"Global cache check failed: {e}, falling back to ViT")
         l2_miss_items = list(all_l1_miss_items)
         l2_miss_token_counts = list(all_l1_miss_token_counts)
+        hash_to_l2_emb = {}
+        # It's safe to release here
+        mm_global_cache_controller.release_embeddings(global_hit_hashes)
 
-    return hash_to_l2_emb, l2_miss_items, l2_miss_token_counts
+    return hash_to_l2_emb, l2_miss_items, l2_miss_token_counts, global_hit_hashes
 
 
 def _sync_tp_cache_hits(
@@ -981,7 +984,7 @@ def _get_chunked_prefill_embedding(
         return None, input_ids
 
     # 2. Check L2 (Global Cache) for L1 misses
-    hash_to_l2_emb, l2_miss_items, l2_miss_token_counts = _check_l2_global_cache(
+    hash_to_l2_emb, l2_miss_items, l2_miss_token_counts, global_hit_hashes = _check_l2_global_cache(
         all_l1_miss_items, all_l1_miss_token_counts, data_embedding_func
     )
 
@@ -1037,8 +1040,13 @@ def _get_chunked_prefill_embedding(
             embedding_list.append(chunk_embedding)
 
     if len(embedding_list) == 0:
+        mm_global_cache_controller.release_embeddings(global_hit_hashes)
         return None, input_ids
-    return torch.concat(embedding_list, dim=0), input_ids
+
+    embedding = torch.concat(embedding_list, dim=0)
+    mm_global_cache_controller.release_embeddings(global_hit_hashes)
+
+    return embedding, input_ids
 
 
 def _get_multimodal_mask(
