@@ -469,15 +469,10 @@ def get_embeddings_distributed_sharded(
     if loaded_shard_hashes:
         controller.release_embeddings(loaded_shard_hashes)
 
-    # 6. Insert missing embeddings into local cpu_pool for future use
-    for h, emb in all_embeddings.items():
-        if emb is not None and not controller._has_hash(h):
-            controller._insert_embedding(h, emb)
-
-    # 7. Cleanup: mark this rank's prefetch as done (if exists)
+    # 6. Cleanup: mark this rank's prefetch as done (if exists)
     if req_id and req_id in controller.ongoing_prefetch:
         with controller.lock:
             controller.ongoing_prefetch.pop(req_id, None)
 
-    # 8. Return in original order
+    # 7. Return in original order
     return [all_embeddings.get(h) for h in image_hashes]
