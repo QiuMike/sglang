@@ -608,10 +608,16 @@ class EmbeddingCacheController:
         return local_results
 
     def _get_embedding_from_local(self, image_hash: str) -> Optional[torch.Tensor]:
-        """Get embedding from local cpu_pool (internal use)."""
+        """Get embedding from local cpu_pool (internal use).
+
+        Caller must call release_embeddings() after the returned tensor
+        is no longer needed (e.g. after all_gather has copied the data).
+        """
         with self.lock:
             if image_hash not in self.hash_to_metadata:
                 return None
+            self._update_access_time(image_hash)
+            self._protect_hash(image_hash)
             offset, num_tokens, dim, size_bytes = self.hash_to_metadata[image_hash][:4]
             return (
                 self.cpu_pool[offset : offset + size_bytes]

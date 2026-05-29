@@ -462,6 +462,13 @@ def get_embeddings_distributed_sharded(
     # This is the ONLY collective communication in sharded loading
     all_embeddings = helper.all_gather_embeddings(local_embeddings, image_hashes)
 
+    # 5.5. Release ref counts on local embeddings now that all_gather has
+    # copied the data. This allows the cache entries to be evicted under
+    # memory pressure during step 6 insertions.
+    loaded_shard_hashes = list(local_embeddings.keys())
+    if loaded_shard_hashes:
+        controller.release_embeddings(loaded_shard_hashes)
+
     # 6. Insert missing embeddings into local cpu_pool for future use
     for h, emb in all_embeddings.items():
         if emb is not None and not controller._has_hash(h):
