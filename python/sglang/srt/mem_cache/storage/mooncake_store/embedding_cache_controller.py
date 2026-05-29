@@ -317,7 +317,7 @@ class EmbeddingCacheController:
                 f"pool full ({self.allocator.get_allocated_size() / 1024**2:.1f}/"
                 f"{self.total_pool_size_bytes / 1024**2:.1f} MB used), "
                 f"no evictable candidates "
-                f"({len(self.hash_to_metadata)} entries, {n_protected} protected)"
+                f"({len(self.hash_to_metadata)} entries, {self.ref_counts=} protected)"
             )
             self.stats["allocation_failures"] += 1
             return None
@@ -648,6 +648,7 @@ class EmbeddingCacheController:
             )
             target_view.copy_(embedding.cpu())
             self.hash_to_metadata[image_hash] = (offset, num_tokens, dim, size_bytes)
+            self._update_access_time(image_hash)
 
         return True
 
