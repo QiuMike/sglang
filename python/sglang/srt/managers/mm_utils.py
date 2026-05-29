@@ -16,7 +16,6 @@ import numpy as np
 import torch
 from torch import nn
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
@@ -666,8 +665,6 @@ def _check_l2_global_cache(
 
     max_batch = envs.SGLANG_MM_GLOBAL_CACHE_MAX_BATCH.get()
     exist_timeout = envs.SGLANG_MM_GLOBAL_CACHE_EXIST_TIMEOUT.get()
-    prefetch_timeout_per_item = envs.SGLANG_MM_GLOBAL_CACHE_PREFETCH_TIMEOUT.get()
-    prefetch_max_timeout = envs.SGLANG_MM_GLOBAL_CACHE_PREFETCH_MAX_TIMEOUT.get()
 
     # Limit batch size to avoid long blocking
     if len(all_l1_miss_items) > max_batch:
@@ -715,76 +712,43 @@ def _check_l2_global_cache(
         for item, tc in zip(overflow_items, overflow_counts):
             l2_check_miss.append((item, tc))
 
-        # Fetch embeddings from global cache for hits
+        # Fetch embeddings from global cache for hits using distributed loading
+        # (sharded if enabled, full-load otherwise; handles TP sync internally)
         if global_hit_hashes:
             expected_tokens = [tc for _, tc in global_hit_items]
-            req_id = (
-                f"prefetch_{str(global_hit_hashes[0])[:16]}"
-                f"_{id(data_embedding_func)}"
-            )
-
             modality = global_hit_items[0][0].modality if global_hit_items else None
-            mm_global_cache_controller.prefetch(
-                req_id, global_hit_hashes, expected_tokens, modality
+
+            global_embeddings = mm_global_cache_controller.get_embeddings_distributed(
+                global_hit_hashes,
+                expected_tokens,
+                modality,
             )
 
-            # Wait for prefetch completion with adaptive timeout
-            import time
-
-            start_wait = time.time()
-            prefetch_timeout = min(
-                prefetch_max_timeout, len(global_hit_hashes) * prefetch_timeout_per_item
-            )
-            while not mm_global_cache_controller.check_prefetch_progress(req_id):
-                if time.time() - start_wait > prefetch_timeout:
-                    logger.debug(
-                        f"Global cache prefetch timeout ({prefetch_timeout:.2f}s), "
-                        f"falling back {len(global_hit_hashes)} items to ViT"
+            successful_items = []
+            for (item, token_count), emb in zip(global_hit_items, global_embeddings):
+                if emb is None:
+                    logger.warning(
+                        f"Global cache returned None for hash {item.hash}, "
+                        f"fallback to ViT"
                     )
-                    # Clean up the ongoing prefetch entry to avoid leaking
-                    # the EmbeddingPrefetchOperation object.
-                    with mm_global_cache_controller.lock:
-                        mm_global_cache_controller.ongoing_prefetch.pop(req_id, None)
-                    # Move all global hits back to L2 misses
-                    for item, tc in global_hit_items:
-                        l2_check_miss.append((item, tc))
-                    global_hit_items = []
-                    global_hit_hashes = []
-                    break
-                time.sleep(0.002)  # 2ms polling interval
+                    l2_check_miss.append((item, token_count))
+                    continue
+                hash_to_l2_emb[item.hash] = emb
+                # Also write to L1 cache for future local hits.
+                # Move to device so L1 stores GPU tensors and avoids
+                # device-mismatch errors in subsequent forward passes.
+                emb_on_device = emb.to(device) if emb.device != device else emb
+                emb_result = EmbeddingResult(embedding=emb_on_device)
+                embedding_cache.set(item.hash, emb_result)
+                successful_items.append((item, token_count))
 
-            # Get embeddings from global cache
-            if global_hit_hashes:
-                global_embeddings = mm_global_cache_controller.get_embeddings(
-                    global_hit_hashes
-                )
-                successful_items = []
-                for (item, token_count), emb in zip(
-                    global_hit_items, global_embeddings
-                ):
-                    if emb is None:
-                        logger.warning(
-                            f"Global cache returned None for hash {item.hash}, "
-                            f"fallback to ViT"
-                        )
-                        l2_check_miss.append((item, token_count))
-                        continue
-                    hash_to_l2_emb[item.hash] = emb
-                    # Also write to L1 cache for future local hits.
-                    # Move to device so L1 stores GPU tensors and avoids
-                    # device-mismatch errors in subsequent forward passes.
-                    emb_on_device = emb.to(device) if emb.device != device else emb
-                    emb_result = EmbeddingResult(embedding=emb_on_device)
-                    embedding_cache.set(item.hash, emb_result)
-                    successful_items.append((item, token_count))
+            # Update global_hit_items to only include successful hits
+            global_hit_items = successful_items
 
-                # Update global_hit_items to only include successful hits
-                global_hit_items = successful_items
-
-                logger.debug(
-                    f"Global cache hit: {len(global_hit_items)} items, "
-                    f"L2 miss/ViT: {len(l2_check_miss)} items"
-                )
+            logger.debug(
+                f"Global cache hit: {len(global_hit_items)} items, "
+                f"L2 miss/ViT: {len(l2_check_miss)} items"
+            )
 
         l2_miss_items = [item for item, _ in l2_check_miss]
         l2_miss_token_counts = [tc for _, tc in l2_check_miss]
@@ -798,96 +762,6 @@ def _check_l2_global_cache(
         mm_global_cache_controller.release_embeddings(global_hit_hashes)
 
     return hash_to_l2_emb, l2_miss_items, l2_miss_token_counts, global_hit_hashes
-
-
-def _sync_tp_cache_hits(
-    pending_requests: list,
-    hash_to_l2_emb: Dict[int, torch.Tensor],
-    l2_miss_items: List[MultimodalDataItem],
-    l2_miss_token_counts: List[int],
-) -> Tuple[list, List[MultimodalDataItem], List[int]]:
-    """Synchronise cache hit status across TP ranks using MIN all_reduce.
-
-    Any item that this rank hit (L1 or L2) but another rank missed is
-    moved to l2_miss_items for re-computation via ViT.
-
-    Returns:
-        (pending_requests, l2_miss_items, l2_miss_token_counts) — updated
-    """
-    tp_size = get_tensor_model_parallel_world_size()
-    if tp_size <= 1 or mm_global_cache_controller is None:
-        return pending_requests, l2_miss_items, l2_miss_token_counts
-
-    # Collect all items across all pending requests for TP sync
-    all_items_for_sync = []
-    for chunk_entries, _, _ in pending_requests:
-        for item, emb, start, end in chunk_entries:
-            all_items_for_sync.append((item, emb))
-
-    # Sort by hash to ensure consistent order across all ranks
-    sorted_items = sorted(all_items_for_sync, key=lambda x: x[0].hash)
-
-    # Build hit mask: 1 for hit (L1 or L2), 0 for miss
-    hit_mask = []
-    for item, emb in sorted_items:
-        is_hit = emb is not None or item.hash in hash_to_l2_emb
-        hit_mask.append(1 if is_hit else 0)
-
-    # MIN operation: if any rank has 0 (miss), result is 0
-    hit_tensor = torch.tensor(hit_mask, dtype=torch.int32, device="cpu")
-    torch.distributed.all_reduce(
-        hit_tensor,
-        op=torch.distributed.ReduceOp.MIN,
-        group=mm_global_cache_controller.prefetch_tp_group,
-    )
-
-    synced_mask = hit_tensor.tolist()
-
-    # Build set of hashes that all ranks have (intersection)
-    synced_hash_set = set()
-    for i, (item, emb) in enumerate(sorted_items):
-        if synced_mask[i] == 1:
-            synced_hash_set.add(item.hash)
-
-    # Items that this rank hit but other ranks missed need to go to ViT
-    # Update chunk_entries and collect items for recompute
-    items_to_recompute = []
-    for req_idx, (chunk_entries, chunk_start, chunk_end) in enumerate(pending_requests):
-        updated_entries = []
-        for item, emb, start, end in chunk_entries:
-            if item.hash not in synced_hash_set and (
-                emb is not None or item.hash in hash_to_l2_emb
-            ):
-                # Local hit but remote miss - need to recompute
-                items_to_recompute.append((item, end - start + 1))
-                updated_entries.append((item, None, start, end))
-                if item.hash in hash_to_l2_emb:
-                    del hash_to_l2_emb[item.hash]
-            else:
-                updated_entries.append((item, emb, start, end))
-        pending_requests[req_idx] = (updated_entries, chunk_start, chunk_end)
-
-    if items_to_recompute:
-        logger.info(
-            f"TP sync: {len(items_to_recompute)} items moved to ViT due to "
-            f"inconsistent cache hit across ranks (local hit but remote miss)"
-        )
-        l2_miss_items = l2_miss_items + [item for item, _ in items_to_recompute]
-        l2_miss_token_counts = l2_miss_token_counts + [
-            tc for _, tc in items_to_recompute
-        ]
-
-    # Log sync results
-    total_items = len(all_items_for_sync)
-    synced_hits = sum(synced_mask)
-    synced_misses = total_items - synced_hits
-    logger.info(
-        f"=== TP Cache Sync === Total: {total_items} | "
-        f"Synced Hits (all ranks): {synced_hits} | "
-        f"Synced Misses (ViT): {synced_misses}"
-    )
-
-    return pending_requests, l2_miss_items, l2_miss_token_counts
 
 
 def _write_back_l2_cache(locally_encoded: list) -> None:
@@ -997,14 +871,11 @@ def _get_chunked_prefill_embedding(
         all_l1_miss_items, all_l1_miss_token_counts, data_embedding_func, device
     )
 
-    # 3. TP-Group synchronization
-    pending_requests, l2_miss_items, l2_miss_token_counts = _sync_tp_cache_hits(
-        pending_requests, hash_to_l2_emb, l2_miss_items, l2_miss_token_counts
-    )
+    # (sharded loading handles TP synchronization internally via all_gather)
 
-    # 4. Batch encode all L2 cache-miss items in one ViT call
-    # 5. Write locally encoded embeddings back to L2 (Global Cache)
-    # 6. Fill in resolved embeddings and assemble per-request chunks
+    # 3. Batch encode all L2 cache-miss items in one ViT call
+    # 4. Write locally encoded embeddings back to L2 (Global Cache)
+    # 5. Fill in resolved embeddings and assemble per-request chunks
     # All steps after _check_l2_global_cache must release ref counts on
     # global_hit_hashes even if an exception occurs, otherwise cache
     # entries are pinned forever.
