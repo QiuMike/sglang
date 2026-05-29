@@ -636,7 +636,7 @@ class EmbeddingCacheController:
             if image_hash in self.hash_to_metadata:
                 return True
 
-            offset = self.allocator.allocate(size_bytes)
+            offset = self._allocate_with_eviction(size_bytes)
             if offset is None:
                 logger.warning(f"Failed to allocate memory for {image_hash}")
                 return False
