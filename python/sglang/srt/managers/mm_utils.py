@@ -882,8 +882,7 @@ def _get_chunked_prefill_embedding(
     try:
         locally_encoded = []
         if l2_miss_items:
-            if not _can_skip_pre_embed_feature_move(data_embedding_func):
-                _move_items_to_device(l2_miss_items, device)
+            _move_items_to_device(l2_miss_items, device)
             all_miss_embedding = data_embedding_func(l2_miss_items)
             all_miss_embedding = all_miss_embedding.reshape(
                 -1, all_miss_embedding.shape[-1]
