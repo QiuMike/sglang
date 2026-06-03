@@ -465,9 +465,10 @@ def get_embeddings_distributed_sharded(
     # 5.5. Release ref counts on local embeddings now that all_gather has
     # copied the data. This allows the cache entries to be evicted under
     # memory pressure during step 6 insertions.
+    # Use async release to avoid blocking on lock contention.
     loaded_shard_hashes = list(local_embeddings.keys())
     if loaded_shard_hashes:
-        controller.release_embeddings(loaded_shard_hashes)
+        controller.async_release_embeddings(loaded_shard_hashes)
 
     # 6. Cleanup: mark this rank's prefetch as done (if exists)
     if req_id and req_id in controller.ongoing_prefetch:

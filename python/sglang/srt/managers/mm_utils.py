@@ -759,7 +759,7 @@ def _check_l2_global_cache(
         l2_miss_token_counts = list(all_l1_miss_token_counts)
         hash_to_l2_emb = {}
         # It's safe to release here
-        mm_global_cache_controller.release_embeddings(global_hit_hashes)
+        mm_global_cache_controller.async_release_embeddings(global_hit_hashes)
 
     return hash_to_l2_emb, l2_miss_items, l2_miss_token_counts, global_hit_hashes
 
@@ -937,7 +937,7 @@ def _get_chunked_prefill_embedding(
         return embedding, input_ids
     finally:
         if mm_global_cache_controller is not None:
-            mm_global_cache_controller.release_embeddings(global_hit_hashes)
+            mm_global_cache_controller.async_release_embeddings(global_hit_hashes)
 
 
 def _get_multimodal_mask(

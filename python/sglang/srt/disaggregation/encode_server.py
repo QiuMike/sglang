@@ -913,8 +913,9 @@ class MMEncoder:
                 # Release embedding cache references now that torch.cat has
                 # copied the data into a new tensor (or an exception occurred).
                 # This allows the cache entries to be evicted under memory pressure.
+                # Use async release to avoid blocking the forward path.
                 if cached_hit_hashes:
-                    self.mm_global_cache.release_embeddings(cached_hit_hashes)
+                    self.mm_global_cache.async_release_embeddings(cached_hit_hashes)
 
             # Background insert: store newly computed embeddings into global cache.
             # Includes both original misses and fallback-recomputed hits.

@@ -168,6 +168,7 @@ class EmbeddingCacheController:
         self.ongoing_prefetch = {}  # {req_id: EmbeddingPrefetchOperation}
         self.prefetch_queue = Queue()
         self.insert_queue = Queue()
+        self.release_queue = Queue()  # Async release: hashes to decrement
 
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -462,7 +463,7 @@ class EmbeddingCacheController:
                 self.insert_queue.put(EmbeddingInsertOperation(keys, ptrs, sizes))
 
     def _io_loop(self):
-        """Asynchronous worker handling both Batch GET and Batch PUT."""
+        """Asynchronous worker handling Batch GET, Batch PUT, and async releases."""
         while not self.stop_event.is_set():
             processed_any = False
 
@@ -495,6 +496,18 @@ class EmbeddingCacheController:
                         self._release_hash(h)
                 self.insert_queue.task_done()
                 processed_any = True
+            except Empty:
+                pass
+
+            # Drain all pending async releases in one batch
+            try:
+                while True:
+                    hashes = self.release_queue.get_nowait()
+                    with self.lock:
+                        for h in hashes:
+                            self._release_hash(h)
+                    self.release_queue.task_done()
+                    processed_any = True
             except Empty:
                 pass
 
@@ -565,6 +578,20 @@ class EmbeddingCacheController:
         with self.lock:
             for h in image_hashes:
                 self._release_hash(h)
+
+    def async_release_embeddings(self, image_hashes: List[str]):
+        """Non-blocking version of release_embeddings.
+
+        Enqueues hashes for background ref-count decrement instead of
+        decrementing synchronously.  Returns immediately, so the caller
+        is never blocked by lock contention.  The IO thread processes
+        the queue within its next loop iteration (typically < 1 ms).
+
+        Safe to call as soon as the caller has copied the data out of
+        the cpu_pool view (e.g. after .to(device) or torch.cat).
+        """
+        if image_hashes:
+            self.release_queue.put(image_hashes)
 
     def get_stats(self) -> dict:
         """Return cache statistics."""
